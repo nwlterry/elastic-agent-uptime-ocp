@@ -1,0 +1,103 @@
+# file: elastic-agent-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elastic-agent-uptime
+  namespace: heartbeat-ns
+  labels:
+    app: elastic-agent-uptime
+spec:
+  replicas: 1                 # Increase if you want active-active HA (leader election still works)
+  selector:
+    matchLabels:
+      app: elastic-agent-uptime
+  template:
+    metadata:
+      labels:
+        app: elastic-agent-uptime
+      annotations:
+        # Optional: force policy reload on config changes
+        fleet.kibana.elastic.co/policy-id: "your-policy-id-here"  # visible in Kibana → Fleet → Agents
+    spec:
+      serviceAccountName: elastic-agent-sa
+      automountServiceAccountToken: true
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      containers:
+        - name: elastic-agent
+          image: docker.elastic.co/elastic-agent/elastic-agent:8.15.3   # match your stack version
+          # For browser/synthetics use: docker.elastic.co/elastic-agent/elastic-agent-complete:8.15.3
+          env:
+            - name: FLEET_ENROLL
+              value: "1"
+            - name: FLEET_URL
+              value: "https://fleet-server.elastic-ns.svc.cluster.local:8220"  # adjust if using Route
+            - name: FLEET_ENROLLMENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: fleet-enrollment-token
+                  key: token
+            - name: FLEET_INSECURE   # use only if Fleet Server uses self-signed cert and you accept the risk
+              value: "false"
+            # Optional: force Logstash output (if not set in Fleet policy)
+            # - name: LOGSTASH_HOST
+            #   value: "logstash.elastic-ns.svc.cluster.local:5044"
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          volumeMounts:
+            - name: agent-state
+              mountPath: /usr/share/elastic-agent/state
+            # - name: fleet-ca
+            #   mountPath: /usr/share/elastic-agent/certs
+      volumes:
+        - name: agent-state
+          emptyDir: {}   # Use PersistentVolumeClaim in production if you need state persistence
+        # - name: fleet-ca
+        #   secret:
+        #     secretName: fleet-server-ca
+      tolerations:
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+        - operator: Exists   # allow scheduling on any node
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: elastic-agent-sa
+  namespace: heartbeat-ns
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: elastic-agent-anyuid
+  namespace: heartbeat-ns
+subjects:
+  - kind: ServiceAccount
+    name: elastic-agent-sa
+    namespace: heartbeat-ns
+roleRef:
+  kind: ClusterRole
+  name: system:openshift:scc:anyuid
+  apiGroup: rbac.authorization.k8s.io
+---
+# Enrollment token secret (create once, reuse)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fleet-enrollment-token
+  namespace: heartbeat-ns
+type: Opaque
+stringData:
+  token: <YOUR_FLEET_ENROLLMENT_TOKEN_HERE>   # copy from Kibana → Fleet → Enrollment tokens
