@@ -1,0 +1,117 @@
+# file: elastic-agent-uptime-minimal.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elastic-agent-uptime
+  namespace: heartbeat-ns
+  labels:
+    app: elastic-agent-uptime
+spec:
+  replicas: 1                                   # 1 is enough — leader election handles it
+  strategy:
+    type: Recreate                              # Saves resources on rollouts
+  selector:
+    matchLabels:
+      app: elastic-agent-uptime
+  template:
+    metadata:
+      labels:
+        app: elastic-agent-uptime
+    spec:
+      serviceAccountName: elastic-agent-sa
+      automountServiceAccountToken: true
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      enableServiceLinks: false                   # Minor memory save
+      containers:
+        - name: elastic-agent
+          image: docker.elastic.co/elastic-agent/elastic-agent:8.15.3   # or 8.16.x
+          # Do NOT use elastic-agent-complete unless you need browser synthetics
+          args:
+            - --foreground                              # Reduces a few MB
+          env:
+            - name: FLEET_ENROLL
+              value: "1"
+            - name: FLEET_URL
+              value: "https://fleet-server.elastic-ns.svc.cluster.local:8220"
+            - name: FLEET_ENROLLMENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: fleet-enrollment-token
+                  key: token
+            # Critical for low memory: disable unnecessary built-in integrations
+            - name: ELASTIC_AGENT_DISABLE_FILESYSTEM_MONITORING
+              value: "true"
+            - name: ELASTIC_AGENT_DISABLE_CLOUD_METADATA
+              value: "true"
+            # Optional but saves ~20–30Mi if you don’t need host metrics/logs
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: 50m               # Absolute minimum that still works reliably
+              memory: 128Mi          # Enough for 50+ TCP monitors
+            limits:
+              cpu: 200m              # Burst limit — prevents OOM if many monitors fail at once
+              memory: 256Mi          # Hard ceiling (OpenShift will kill if exceeded)
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 6791           # Agent health endpoint
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 6791
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          volumeMounts:
+            - name: agent-state
+              mountPath: /usr/share/elastic-agent/state
+      volumes:
+        - name: agent-state
+          emptyDir:
+            medium: Memory         # Optional: keeps state in tmpfs (faster, but lost on restart)
+      tolerations:
+        - operator: Exists       # Allow scheduling anywhere
+---
+# Keep the rest unchanged (SA, SCC binding, secret) — copy from previous manifest
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: elastic-agent-sa
+  namespace: heartbeat-ns
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: elastic-agent-anyuid
+  namespace: heartbeat-ns
+subjects:
+  - kind: ServiceAccount
+    name: elastic-agent-sa
+    namespace: heartbeat-ns
+roleRef:
+  kind: ClusterRole
+  name: system:openshift:scc:anyuid
+  apiGroup: rbac.authorization.k8 subnet
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fleet-enrollment-token
+  namespace: heartbeat-ns
+type: Opaque
+stringData:
+  token: YOUR_ENROLLMENT_TOKEN_HERE
