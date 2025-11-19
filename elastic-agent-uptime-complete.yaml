@@ -1,0 +1,331 @@
+# =============================================================================
+# COMPLETE OPENSHIFT DEPLOYMENT – ALL COMPONENTS ON 8.18.4
+# Fleet Server + Logstash + Minimal Elastic Agent (Uptime only)
+# =============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: elastic-ns
+  labels:
+    name: elastic-ns
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: heartbeat-ns
+  labels:
+    name: heartbeat-ns
+
+# =============================================================================
+# 1. elastic-ns: Fleet Server (running as elastic-agent 8.18.4 in Fleet mode)
+# =============================================================================
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fleet-server
+  namespace: elastic-ns
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fleet-server-anyuid
+  namespace: elastic-ns
+subjects:
+  - kind: ServiceAccount
+    name: fleet-server
+    namespace: elastic-ns
+roleRef:
+  kind: ClusterRole
+  name: system:openshift:scc:anyuid
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fleet-server
+  namespace: elastic-ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fleet-server
+  template:
+    metadata:
+      labels:
+        app: fleet-server
+    spec:
+      serviceAccountName: fleet-server
+      containers:
+        - name: fleet-server
+          image: docker.elastic.co/elastic-agent/elastic-agent:8.18.4   # ← UPDATED
+          args: ["--fleet-server"]
+          env:
+            - name: FLEET_SERVER_ENABLE
+              value: "true"
+            - name: FLEET_SERVER_ELASTICSEARCH_HOST
+              value: "https://your-external-es.example.com:9200"   # ← CHANGE
+            - name: FLEET_SERVER_ELASTICSEARCH_USERNAME
+              value: "elastic"
+            - name: FLEET_SERVER_ELASTICSEARCH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: es-credentials
+                  key: password
+            - name: FLEET_SERVER_HOST
+              value: "0.0.0.0"
+            - name: FLEET_SERVER_PORT
+              value: "8220"
+            - name: FLEET_SERVER_CERT
+              value: /certs/fleet-server.crt
+            - name: FLEET_SERVER_CERT_KEY
+              value: /certs/fleet-server.key
+          ports:
+            - containerPort: 8220
+              name: fleet
+          volumeMounts:
+            - name: fleet-certs
+              mountPath: /certs
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+      volumes:
+        - name: fleet-certs
+          secret:
+            secretName: fleet-server-certs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fleet-server
+  namespace: elastic-ns
+spec:
+  selector:
+    app: fleet-server
+  ports:
+    - port: 8220
+      targetPort: 8220
+      name: fleet
+
+# =============================================================================
+# 2. elastic-ns: Logstash (still uses dedicated Logstash image – unchanged)
+# =============================================================================
+---
+apiVersion: v1
+  kind: ServiceAccount
+metadata:
+  name: logstash
+  namespace: elastic-ns
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: logstash-anyuid
+  namespace: elastic-ns
+subjects:
+  - kind: ServiceAccount
+    name: logstash
+    namespace: elastic-ns
+roleRef:
+  kind: ClusterRole
+  name: system:openshift:scc:anyuid
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logstash
+  namespace: elastic-ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: logstash
+  template:
+    metadata:
+      labels:
+        app: logstash
+    spec:
+      serviceAccountName: logstash
+      containers:
+        - name: logstash
+          image: docker.elastic.co/logstash/logstash:8.18.4          # ← UPDATED to match
+          ports:
+            - containerPort: 5044
+              name: beats
+          volumeMounts:
+            - name: logstash-config
+              mountPath: /usr/share/logstash/config/logstash.yml
+              subPath: logstash.yml
+            - name: logstash-pipeline
+              mountPath: /usr/share/logstash/pipeline/uptime.conf
+              subPath: uptime.conf
+          env:
+            - name: ES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: es-credentials
+                  key: password
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+      volumes:
+        - name: logstash-config
+          configMap:
+            name: logstash-config
+        - name: logstash-pipeline
+          configMap:
+            name: logstash-pipeline
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: logstash
+  namespace: elastic-ns
+spec:
+  selector:
+    app: logstash
+  ports:
+    - port: 5044
+      targetPort: 5044
+      name: beats
+
+# =============================================================================
+# 3. Logstash ConfigMaps (unchanged)
+# =============================================================================
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logstash-config
+  namespace: elastic-ns
+data:
+  logstash.yml: |
+    http.host: "0.0.0.0"
+    xpack.monitoring.enabled: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logstash-pipeline
+  namespace: elastic-ns
+data:
+  uptime.conf: |
+    input {
+      beats {
+        port => 5044
+      }
+    }
+    filter {
+      date {
+        match => [ "@timestamp", "ISO8601" ]
+      }
+    }
+    output {
+      elasticsearch {
+        hosts => ["https://your-external-es.example.com:9200"]
+        user => "elastic"
+        password => "${ES_PASSWORD}"
+        index => "uptime-heartbeat-%{+YYYY.MM.dd}"
+        ecs_compatibility => v8
+      }
+      stdout { codec => rubydebug }
+    }
+
+# =============================================================================
+# 4. heartbeat-ns: Ultra-minimal Elastic Agent (Uptime only) – 8.18.4
+# =============================================================================
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: elastic-agent-sa
+  namespace: heartbeat-ns
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: elastic-agent-anyuid
+  namespace: heartbeat-ns
+subjects:
+  - kind: ServiceAccount
+    name: elastic-agent-sa
+    namespace: heartbeat-ns
+roleRef:
+  kind: ClusterRole
+  name: system:openshift:scc:anyuid
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elastic-agent-uptime
+  namespace: heartbeat-ns
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: elastic-agent-uptime
+  template:
+    metadata:
+      labels:
+        app: elastic-agent-uptime
+    spec:
+      serviceAccountName: elastic-agent-sa
+      containers:
+        - name: elastic-agent
+          image: docker.elastic.co/elastic-agent/elastic-agent:8.18.4   # ← UPDATED
+          args: ["--foreground"]
+          env:
+            - name: FLEET_ENROLL
+              value: "1"
+            - name: FLEET_URL
+              value: "https://fleet-server.elastic-ns.svc.cluster.local:8220"
+            - name: FLEET_ENROLLMENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: fleet-enrollment-token
+                  key: token
+            - name: ELASTIC_AGENT_DISABLE_FILESYSTEM_MONITORING
+              value: "true"
+            - name: ELASTIC_AGENT_DISABLE_CLOUD_METADATA
+              value: "true"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 6791
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 6791
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      tolerations:
+        - operator: Exists
+
+# =============================================================================
+# 5. Secrets (create manually – unchanged)
+# =============================================================================
+# oc create secret generic es-credentials -n elastic-ns --from-literal=password=CHANGEME
+# oc create secret tls fleet-server-certs -n elastic-ns --cert=fleet-server.crt --key=fleet-server.key
+# oc create secret generic fleet-enrollment-token -n heartbeat-ns --from-literal=token=YOUR_TOKEN_FROM_KIBANA
