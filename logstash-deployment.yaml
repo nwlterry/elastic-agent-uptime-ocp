@@ -1,0 +1,133 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logstash-pipeline
+data:
+  logstash.conf: |
+    input {
+      beats {
+        port => 5044
+      }
+    }
+
+    filter {
+      # Tag and enrich Elastic Agent / Heartbeat uptime monitoring data
+      if [data_stream][dataset] == "heartbeat" or "heartbeat" in [tags] or [monitor] {
+        mutate {
+          add_field => { "synthetic_monitor" => "true" }
+          add_tag => [ "elastic_agent_heartbeat" ]
+        }
+      }
+    }
+
+    output {
+      elasticsearch {
+        hosts => [ 
+          "https://elasticsearch.yourdomain.com:9200"   # <-- Change to your actual ES HTTPS endpoint
+          # For direct node access (optional, if no load balancer):
+          # "https://es-node-01.yourdomain.com:9200",
+          # "https://es-node-02.yourdomain.com:9200",
+          # "https://es-node-03.yourdomain.com:9200"
+        ]
+        user => "elastic"
+        password => "${ES_PASSWORD}"
+        index => "heartbeat-%{+YYYY.MM.dd}"
+
+        # HTTPS with self-signed or custom CA
+        ssl => true
+        ssl_verification_mode => "certificate"   # Use "full" if you validate hostname too
+        cacert => "/etc/logstash/certs/ca.crt"   # Path to your CA certificate
+      }
+
+      # Remove in production
+      stdout { codec => rubydebug }
+    }
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: logstash-es-credentials
+type: Opaque
+stringData:
+  ES_PASSWORD: "your-elastic-superuser-password-here"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: logstash-ca-cert
+type: Opaque
+stringData:
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    # Paste your Elasticsearch CA certificate here (or corporate CA)
+    # Example: cat elasticsearch-ca.crt | oc create secret generic logstash-ca-cert --from-file=ca.crt=-
+    MIIF...
+    -----END CERTIFICATE-----
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logstash
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: logstash
+  template:
+    metadata:
+      labels:
+        app: logstash
+    spec:
+      containers:
+      - name: logstash
+        image: docker.elastic.co/logstash/logstash:8.15.2
+        args: ["-f", "/usr/share/logstash/pipeline/logstash.conf"]
+        ports:
+        - containerPort: 5044
+          name: beats
+        - containerPort: 9600
+          name: api
+        env:
+        - name: ES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: logstash-es-credentials
+              key: ES_PASSWORD
+        volumeMounts:
+        - name: pipeline
+          mountPath: /usr/share/logstash/pipeline
+        - name: ca-cert
+          mountPath: /etc/logstash/certs
+          readOnly: true
+        resources:
+          limits:
+            memory: 4Gi
+            cpu: "2"
+          requests:
+            memory: 2Gi
+            cpu: "1"
+        securityContext:
+          runAsUser: 1000
+          capabilities:
+            drop:
+            - ALL
+      volumes:
+      - name: pipeline
+        configMap:
+          name: logstash-pipeline
+      - name: ca-cert
+        secret:
+          secretName: logstash-ca-cert
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: logstash-beats
+spec:
+  type: ClusterIP          # Strictly internal to OpenShift
+  selector:
+    app: logstash
+  ports:
+  - port: 5044
+    targetPort: 5044
+    name: beats
