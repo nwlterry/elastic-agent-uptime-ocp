@@ -11,37 +11,35 @@ data:
     }
 
     filter {
-      # Elastic 8.18+ Synthetic Monitors (Heartbeat integration inside Elastic Agent)
-      # Force correct data_stream fields so Logstash routes to the official synthetics-* data streams
-
       if [event][module] == "heartbeat" or "heartbeat" in [tags] or [monitor] {
         mutate {
-          # Core data_stream fields required for synthetics data streams
-          replace_field => { "[data_stream][type]" => "synthetics" }
+          # First wipe any existing (wrong) data_stream fields
+          remove_field => [ "[data_stream][type]" "[data_stream][dataset]" "[data_stream][namespace]" ]
 
-          # Route based on monitor type
+          # Now set the correct synthetics-* values – this syntax is bullet-proof
+          add_field => {
+            "[data_stream][type]"       => "synthetics"
+            "[data_stream][namespace]"  => "default"
+          }
+
+          # Dataset per monitor type
           if [monitor][type] == "tcp" {
-            replace_field => { "[data_stream][dataset]" => "tcp" }
+            add_field => { "[data_stream][dataset]" => "tcp" }
           }
           else if [monitor][type] == "http" {
-            replace_field => { "[data_stream][dataset]" => "http" }
+            add_field => { "[data_stream][dataset]" => "http" }
           }
           else if [monitor][type] == "browser" {
-            replace_field => { "[data_stream][dataset]" => "browser" }
+            add_field => { "[data_stream][dataset]" => "browser" }
           }
           else if [monitor][type] == "icmp" {
-            replace_field => { "[data_stream][dataset]" => "icmp" }
+            add_field => { "[data_stream][dataset]" => "icmp" }
           }
           else {
-            # Fallback for any new/future types
-            replace_field => { "[data_stream][dataset]" => "%{[monitor][type]}" }
+            add_field => { "[data_stream][dataset]" => "%{[monitor][type]}" }
           }
 
-          # Change this only if you use non-default namespace in Fleet/Agent policy
-          replace_field => { "[data_stream][namespace]" => "default" }
-
-          # Optional: clean up or add tags
-          add_tag => [ "via_logstash", "synthetic_monitoring" ]
+          add_tag => [ "via_logstash" "synthetics" ]
         }
       }
     }
